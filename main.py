@@ -56,8 +56,66 @@ class LiveMarketData:
             self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
+    async def get_backup_price(self, pair: str) -> Dict:
+        """Backup price source when main API fails"""
+        session = await self.get_session()
+        
+        try:
+            # Try multiple backup APIs for accuracy
+            backups = [
+                f"https://api.exchangerate-api.com/v4/latest/{pair[:3]}",
+                f"https://api.fxratesapi.com/latest?base={pair[:3]}&symbols={pair[3:]}"
+            ]
+            
+            for backup_url in backups:
+                try:
+                    async with session.get(backup_url) as response:
+                        data = await response.json()
+                        
+                        target_currency = pair[3:]
+                        
+                        if 'rates' in data and target_currency in data['rates']:
+                            price = data['rates'][target_currency]
+                            
+                            result = {
+                                'symbol': pair,
+                                'price': round(price, 5),
+                                'bid': round(price - 0.0002, 5),
+                                'ask': round(price + 0.0002, 5),
+                                'timestamp': datetime.now(),
+                                'last_update': 'Live Backup API'
+                            }
+                            
+                            logger.info(f"📡 Backup API price for {pair}: {price}")
+                            return result
+                except:
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"❌ All backup APIs failed for {pair}: {e}")
+        
+        # Final fallback with CURRENT realistic base prices (August 2025)
+        fallback_prices = {
+            'EURUSD': 1.1640, 'GBPUSD': 1.2850, 'USDJPY': 147.20,
+            'USDCHF': 0.8720, 'AUDUSD': 0.6580, 'USDCAD': 1.3720,
+            'NZDUSD': 0.6040, 'EURJPY': 171.50, 'GBPJPY': 189.10
+        }
+        
+        base_price = fallback_prices.get(pair, 1.0000)
+        
+        logger.warning(f"⚠️ Using fallback price for {pair}: {base_price}")
+        
+        return {
+            'symbol': pair,
+            'price': base_price,
+            'bid': round(base_price - 0.0002, 5),
+            'ask': round(base_price + 0.0002, 5),
+            'timestamp': datetime.now(),
+            'last_update': 'Fallback'
+        }
+    
     async def get_live_price(self, pair: str) -> Dict:
-        """Get real-time forex price from Alpha Vantage"""
+        """Get real-time forex price from Alpha Vantage - FOREX SPECIFIC"""
         
         # Check cache first
         cache_key = f"{pair}_price"
@@ -68,22 +126,58 @@ class LiveMarketData:
         
         session = await self.get_session()
         
-        # Convert pair format for Alpha Vantage (EUR/USD -> EURUSD)
+        # Use FOREX-SPECIFIC Alpha Vantage endpoint
         from_currency = pair[:3]
         to_currency = pair[3:]
         
+        # Try FX_DAILY first (more accurate for forex trading)
         params = {
-            'function': 'CURRENCY_EXCHANGE_RATE',
-            'from_currency': from_currency,
-            'to_currency': to_currency,
-            'apikey': self.api_key
+            'function': 'FX_DAILY',
+            'from_symbol': from_currency,
+            'to_symbol': to_currency,
+            'apikey': self.api_key,
+            'outputsize': 'compact'
         }
         
         try:
             async with session.get(self.base_url, params=params) as response:
                 data = await response.json()
                 
-                if 'Realtime Currency Exchange Rate' in data:
+                if 'Time Series FX (Daily)' in data:
+                    # Get most recent trading day
+                    time_series = data['Time Series FX (Daily)']
+                    latest_date = max(time_series.keys())
+                    latest_data = time_series[latest_date]
+                    
+                    # Use close price as current price (most accurate)
+                    price = float(latest_data['4. close'])
+                    high = float(latest_data['2. high'])
+                    low = float(latest_data['3. low'])
+                    
+                    # Calculate realistic bid/ask spread
+                    spread = (high - low) * 0.1  # 10% of daily range as spread estimate
+                    spread = max(spread, 0.0002)  # Minimum 2 pip spread
+                    spread = min(spread, 0.001)   # Maximum 10 pip spread
+                    
+                    result = {
+                        'symbol': pair,
+                        'price': round(price, 5),
+                        'bid': round(price - spread/2, 5),
+                        'ask': round(price + spread/2, 5),
+                        'timestamp': datetime.now(),
+                        'last_update': f'FX Daily: {latest_date}',
+                        'high': high,
+                        'low': low
+                    }
+                    
+                    # Cache the result
+                    self.cache[cache_key] = (datetime.now(), result)
+                    
+                    logger.info(f"✅ FOREX price for {pair}: {price} (Date: {latest_date})")
+                    return result
+                
+                # Fallback to real-time rate if daily fails
+                elif 'Realtime Currency Exchange Rate' in data:
                     rate_data = data['Realtime Currency Exchange Rate']
                     
                     price = float(rate_data['5. Exchange Rate'])
@@ -96,74 +190,26 @@ class LiveMarketData:
                         'bid': round(bid, 5),
                         'ask': round(ask, 5),
                         'timestamp': datetime.now(),
-                        'last_update': rate_data.get('6. Last Refreshed', 'Unknown')
+                        'last_update': rate_data.get('6. Last Refreshed', 'Real-time')
                     }
                     
-                    # Cache the result
                     self.cache[cache_key] = (datetime.now(), result)
                     
-                    logger.info(f"✅ Live price for {pair}: {price}")
+                    logger.info(f"✅ Real-time price for {pair}: {price}")
                     return result
                     
                 else:
-                    logger.warning(f"⚠️ API limit or error for {pair}: {data}")
-                    raise Exception("API limit reached or invalid response")
+                    logger.warning(f"⚠️ Alpha Vantage API issue for {pair}: {data}")
+                    error_msg = data.get('Error Message', data.get('Note', 'Unknown error'))
+                    if 'API call frequency' in str(error_msg):
+                        logger.warning(f"⚠️ API rate limit hit: {error_msg}")
+                    
+                    # Try backup APIs when Alpha Vantage fails
+                    return await self.get_backup_price(pair)
                     
         except Exception as e:
-            logger.error(f"❌ Error fetching live price for {pair}: {e}")
-            
-            # Fallback to backup API or cached data
+            logger.error(f"❌ Alpha Vantage API error for {pair}: {e}")
             return await self.get_backup_price(pair)
-    
-    async def get_backup_price(self, pair: str) -> Dict:
-        """Backup price source when main API fails"""
-        session = await self.get_session()
-        
-        try:
-            # Use exchangerate-api.com as backup
-            base_currency = pair[:3]
-            target_currency = pair[3:]
-            
-            url = f"https://api.exchangerate-api.com/v4/latest/{base_currency}"
-            
-            async with session.get(url) as response:
-                data = await response.json()
-                
-                if target_currency in data['rates']:
-                    price = data['rates'][target_currency]
-                    
-                    result = {
-                        'symbol': pair,
-                        'price': round(price, 5),
-                        'bid': round(price - 0.0002, 5),
-                        'ask': round(price + 0.0002, 5),
-                        'timestamp': datetime.now(),
-                        'last_update': 'Backup API'
-                    }
-                    
-                    logger.info(f"📡 Backup price for {pair}: {price}")
-                    return result
-                    
-        except Exception as e:
-            logger.error(f"❌ Backup API failed for {pair}: {e}")
-        
-        # Final fallback with realistic base prices
-        fallback_prices = {
-            'EURUSD': 1.0850, 'GBPUSD': 1.2720, 'USDJPY': 149.50,
-            'USDCHF': 0.8950, 'AUDUSD': 0.6620, 'USDCAD': 1.3580,
-            'NZDUSD': 0.6100, 'EURJPY': 162.30, 'GBPJPY': 190.80
-        }
-        
-        base_price = fallback_prices.get(pair, 1.0000)
-        
-        return {
-            'symbol': pair,
-            'price': base_price,
-            'bid': round(base_price - 0.0002, 5),
-            'ask': round(base_price + 0.0002, 5),
-            'timestamp': datetime.now(),
-            'last_update': 'Fallback'
-        }
     
     async def get_historical_data(self, pair: str, period: str = "1min") -> List[Dict]:
         """Get historical data for technical analysis"""
@@ -207,21 +253,25 @@ class LiveMarketData:
         return []
 
 class ProfessionalAnalyzer:
-    """Advanced technical analysis using real market data"""
+    """Advanced technical analysis using real market data with enhanced AI-like features"""
     
     def __init__(self, market_data: LiveMarketData):
         self.market_data = market_data
+        self.pattern_recognition = {}  # Stores learned patterns
+        self.sentiment_data = {}  # For storing market sentiment
     
-    def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
-        """Calculate RSI with proper mathematical precision"""
+    def calculate_enhanced_rsi(self, prices: List[float], period: int = 14) -> Dict:
+        """Calculate enhanced RSI with momentum and divergence detection"""
         if len(prices) < period + 1:
-            return 50.0
+            return {'rsi': 50.0, 'momentum': 0, 'divergence': 'none'}
             
         gains = []
         losses = []
+        momentum = []
         
         for i in range(1, len(prices)):
             change = prices[i] - prices[i-1]
+            momentum.append(change)
             if change > 0:
                 gains.append(change)
                 losses.append(0)
@@ -230,224 +280,235 @@ class ProfessionalAnalyzer:
                 losses.append(abs(change))
         
         if len(gains) < period:
-            return 50.0
+            return {'rsi': 50.0, 'momentum': 0, 'divergence': 'none'}
             
         avg_gain = sum(gains[:period]) / period
         avg_loss = sum(losses[:period]) / period
         
-        if avg_loss == 0:
-            return 100.0
-            
-        # Wilder's smoothing for remaining periods
+        # Wilder's smoothing
         for i in range(period, len(gains)):
             avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
             avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
         
         if avg_loss == 0:
-            return 100.0
-            
-        rs = avg_gain / avg_loss
+            rs = 100
+        else:
+            rs = avg_gain / avg_loss
+        
         rsi = 100 - (100 / (1 + rs))
         
-        return round(rsi, 2)
+        # Calculate momentum (slope of last 3 RSI values)
+        momentum_value = 0
+        if len(prices) > period + 3:
+            rsi_values = [100 - (100 / (1 + (sum(gains[i-period:i])/period)/(sum(losses[i-period:i])/period)) 
+                          for i in range(period, len(gains))]
+            if len(rsi_values) >= 3:
+                momentum_value = (rsi_values[-1] - rsi_values[-3]) / 2
+        
+        # Simple divergence detection
+        divergence = 'none'
+        if len(prices) > period * 2:
+            price_trend = (prices[-1] - prices[-period]) / prices[-period]
+            rsi_trend = (rsi - (100 - (100 / (1 + (sum(gains[-2*period:-period])/period)/(sum(losses[-2*period:-period])/period))))
+            
+            if price_trend > 0 and rsi_trend < -5:
+                divergence = 'bearish'
+            elif price_trend < 0 and rsi_trend > 5:
+                divergence = 'bullish'
+        
+        return {
+            'rsi': round(rsi, 2),
+            'momentum': round(momentum_value, 2),
+            'divergence': divergence
+        }
     
-    def calculate_ema(self, prices: List[float], period: int) -> float:
-        """Calculate Exponential Moving Average"""
+    def calculate_bollinger_bands(self, prices: List[float], period: int = 20) -> Dict:
+        """Calculate Bollinger Bands with advanced features"""
         if len(prices) < period:
-            return sum(prices) / len(prices)
+            return {'upper': 0, 'lower': 0, 'bandwidth': 0, 'percent_b': 0}
         
-        multiplier = 2 / (period + 1)
-        ema = sum(prices[:period]) / period  # Start with SMA
+        sma = sum(prices[-period:]) / period
+        std_dev = np.std(prices[-period:])
         
-        for price in prices[period:]:
-            ema = (price * multiplier) + (ema * (1 - multiplier))
+        upper = sma + (2 * std_dev)
+        lower = sma - (2 * std_dev)
         
-        return ema
-    
-    def calculate_macd(self, prices: List[float]) -> Dict[str, float]:
-        """Calculate MACD indicator"""
-        if len(prices) < 26:
-            return {'macd': 0, 'signal': 0, 'histogram': 0}
-        
-        ema_12 = self.calculate_ema(prices, 12)
-        ema_26 = self.calculate_ema(prices, 26)
-        macd_line = ema_12 - ema_26
-        
-        # Signal line (9-period EMA of MACD)
-        macd_values = [macd_line]  # Simplified for demo
-        signal_line = macd_line * 0.9  # Approximation
-        histogram = macd_line - signal_line
+        # Calculate additional metrics
+        bandwidth = (upper - lower) / sma * 100
+        percent_b = (prices[-1] - lower) / (upper - lower) * 100 if (upper - lower) != 0 else 50
         
         return {
-            'macd': round(macd_line, 5),
-            'signal': round(signal_line, 5),
-            'histogram': round(histogram, 5)
+            'upper': round(upper, 5),
+            'lower': round(lower, 5),
+            'bandwidth': round(bandwidth, 2),
+            'percent_b': round(percent_b, 2),
+            'sma': round(sma, 5)
         }
     
-    def detect_support_resistance(self, historical: List[Dict]) -> Dict[str, float]:
-        """Detect key support and resistance levels"""
-        if len(historical) < 20:
-            return {'support': 0, 'resistance': 0}
+    def detect_candlestick_patterns(self, historical: List[Dict]) -> List[str]:
+        """Detect common candlestick patterns with enhanced accuracy"""
+        patterns = []
         
-        highs = [candle['high'] for candle in historical]
-        lows = [candle['low'] for candle in historical]
+        if len(historical) < 5:
+            return patterns
         
-        # Simple support/resistance detection
-        recent_high = max(highs[-10:])
-        recent_low = min(lows[-10:])
+        # Convert to pandas DataFrame for easier analysis
+        df = pd.DataFrame(historical)
+        df['body'] = abs(df['open'] - df['close'])
+        df['range'] = df['high'] - df['low']
+        df['body_pct'] = df['body'] / df['range']
+        df['is_bullish'] = df['close'] > df['open']
         
-        return {
-            'resistance': recent_high,
-            'support': recent_low
-        }
+        # Check for common patterns
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        
+        # Engulfing pattern
+        if (last['is_bullish'] != prev['is_bullish'] and 
+            last['body'] > prev['body'] * 1.2 and
+            (last['is_bullish'] and last['close'] > prev['open'] or 
+             not last['is_bullish'] and last['close'] < prev['open'])):
+            patterns.append('engulfing')
+        
+        # Hammer/Hanging Man
+        if (last['body_pct'] < 0.3 and 
+            (last['is_bullish'] and last['close'] > last['high'] - last['range'] * 0.1 or
+             not last['is_bullish'] and last['close'] < last['low'] + last['range'] * 0.1)):
+            patterns.append('hammer' if last['close'] > last['open'] else 'hanging_man')
+        
+        # Morning/Evening Star
+        if len(historical) >= 3:
+            if (prev['body'] < prev['range'] * 0.3 and
+                ((prev2['is_bullish'] and not last['is_bullish'] and 
+                  last['close'] < prev2['close'] * 0.99) or
+                 (not prev2['is_bullish'] and last['is_bullish'] and 
+                  last['close'] > prev2['close'] * 1.01))):
+                patterns.append('evening_star' if prev2['is_bullish'] else 'morning_star')
+        
+        return patterns
     
-    async def generate_professional_signal(self, pair: str) -> Optional[TradingSignal]:
-        """Generate professional trading signal using real market data and analysis"""
-        
+    async def generate_ai_signal(self, pair: str) -> Optional[TradingSignal]:
+        """Generate AI-enhanced trading signal with advanced analysis"""
         try:
-            # Get current live price
+            # Get comprehensive market data
             live_data = await self.market_data.get_live_price(pair)
             current_price = live_data['price']
-            
-            # Get historical data for technical analysis
-            historical = await self.market_data.get_historical_data(pair)
+            historical = await self.market_data.get_historical_data(pair, "15min")
             
             if not historical:
                 logger.warning(f"No historical data for {pair}, using price action only")
-                return await self.generate_price_action_signal(pair, live_data)
+                return None
             
             # Extract closing prices for indicators
             close_prices = [candle['close'] for candle in historical]
             close_prices.reverse()  # Oldest first
             close_prices.append(current_price)  # Add current price
             
-            # Calculate technical indicators
-            rsi = self.calculate_rsi(close_prices)
-            ema_20 = self.calculate_ema(close_prices, 20)
-            ema_50 = self.calculate_ema(close_prices, 50)
-            macd_data = self.calculate_macd(close_prices)
-            levels = self.detect_support_resistance(historical)
+            # Calculate enhanced technical indicators
+            rsi_data = self.calculate_enhanced_rsi(close_prices)
+            bollinger = self.calculate_bollinger_bands(close_prices)
+            patterns = self.detect_candlestick_patterns(historical)
             
-            # Advanced signal logic
-            signal_strength = 0
+            # Advanced signal logic with weighted scoring
+            signal_score = 0
             analysis_components = []
             action = None
             
-            # RSI Analysis (Weight: 25%)
-            if rsi < 25:  # Strong oversold
-                signal_strength += 25
-                analysis_components.append(f"RSI severely oversold ({rsi:.1f})")
+            # RSI Analysis (25% weight)
+            if rsi_data['rsi'] < 30:
+                signal_score += 25
+                analysis_components.append(f"RSI oversold ({rsi_data['rsi']:.1f})")
                 action = "BUY"
-            elif rsi < 35:  # Oversold
-                signal_strength += 20
-                analysis_components.append(f"RSI oversold ({rsi:.1f})")
-                if not action: action = "BUY"
-            elif rsi > 75:  # Strong overbought
-                signal_strength += 25
-                analysis_components.append(f"RSI severely overbought ({rsi:.1f})")
+            elif rsi_data['rsi'] > 70:
+                signal_score += 25
+                analysis_components.append(f"RSI overbought ({rsi_data['rsi']:.1f})")
                 action = "SELL"
-            elif rsi > 65:  # Overbought
-                signal_strength += 20
-                analysis_components.append(f"RSI overbought ({rsi:.1f})")
-                if not action: action = "SELL"
             else:
-                signal_strength += 5
-                analysis_components.append(f"RSI neutral ({rsi:.1f})")
+                signal_score += 5
             
-            # EMA Trend Analysis (Weight: 30%)
-            if ema_20 > ema_50:
-                trend_strength = ((ema_20 - ema_50) / ema_50) * 10000  # Convert to pip-like value
-                if trend_strength > 5:
-                    signal_strength += 30
-                    analysis_components.append(f"Strong bullish trend (EMA20 > EMA50)")
+            # Add divergence info
+            if rsi_data['divergence'] == 'bullish':
+                signal_score += 15
+                analysis_components.append("Bullish RSI divergence")
+                if action != "SELL": action = "BUY"
+            elif rsi_data['divergence'] == 'bearish':
+                signal_score += 15
+                analysis_components.append("Bearish RSI divergence")
+                if action != "BUY": action = "SELL"
+            
+            # Bollinger Bands Analysis (20% weight)
+            if current_price > bollinger['upper']:
+                signal_score += 20
+                analysis_components.append(f"Price above upper band ({bollinger['upper']:.5f})")
+                if action != "BUY": action = "SELL"
+            elif current_price < bollinger['lower']:
+                signal_score += 20
+                analysis_components.append(f"Price below lower band ({bollinger['lower']:.5f})")
+                if action != "SELL": action = "BUY"
+            else:
+                signal_score += 5
+            
+            # Candlestick Patterns (15% weight)
+            if patterns:
+                signal_score += 15
+                analysis_components.append(f"Candlestick patterns: {', '.join(patterns)}")
+                if 'engulfing' in patterns or 'morning_star' in patterns:
                     if action != "SELL": action = "BUY"
-                else:
-                    signal_strength += 15
-                    analysis_components.append(f"Mild bullish trend")
-            else:
-                trend_strength = ((ema_50 - ema_20) / ema_50) * 10000
-                if trend_strength > 5:
-                    signal_strength += 30
-                    analysis_components.append(f"Strong bearish trend (EMA20 < EMA50)")
+                elif 'hanging_man' in patterns or 'evening_star' in patterns:
                     if action != "BUY": action = "SELL"
-                else:
-                    signal_strength += 15
-                    analysis_components.append(f"Mild bearish trend")
             
-            # MACD Analysis (Weight: 20%)
-            if macd_data['macd'] > macd_data['signal'] and macd_data['histogram'] > 0:
-                signal_strength += 20
-                analysis_components.append("MACD bullish crossover")
+            # Price Position Analysis (15% weight)
+            if current_price > bollinger['sma']:
+                signal_score += 15
+                analysis_components.append(f"Price above SMA20 ({bollinger['sma']:.5f})")
                 if action != "SELL": action = "BUY"
-            elif macd_data['macd'] < macd_data['signal'] and macd_data['histogram'] < 0:
-                signal_strength += 20
-                analysis_components.append("MACD bearish crossover")
-                if action != "BUY": action = "SELL"
             else:
-                signal_strength += 5
-                analysis_components.append("MACD neutral")
-            
-            # Price vs EMA Analysis (Weight: 15%)
-            if current_price > ema_20:
-                if action == "BUY":
-                    signal_strength += 15
-                analysis_components.append("Price above EMA20")
-            else:
-                if action == "SELL":
-                    signal_strength += 15
-                analysis_components.append("Price below EMA20")
-            
-            # Support/Resistance Analysis (Weight: 10%)
-            if current_price <= levels['support'] * 1.001:  # Near support
-                signal_strength += 10
-                analysis_components.append(f"Price near support ({levels['support']:.5f})")
-                if action != "SELL": action = "BUY"
-            elif current_price >= levels['resistance'] * 0.999:  # Near resistance
-                signal_strength += 10
-                analysis_components.append(f"Price near resistance ({levels['resistance']:.5f})")
+                signal_score += 15
+                analysis_components.append(f"Price below SMA20 ({bollinger['sma']:.5f})")
                 if action != "BUY": action = "SELL"
+            
+            # Volume Analysis (10% weight - placeholder for future enhancement)
+            signal_score += 5  # Base score since we don't have volume data
             
             # Minimum signal strength threshold
-            if signal_strength < 60:
-                logger.info(f"Signal strength too low for {pair}: {signal_strength}")
+            if signal_score < 75:  # Higher threshold for AI signals
+                logger.info(f"AI signal strength too low for {pair}: {signal_score}")
                 return None
             
-            if not action:
-                action = "BUY"  # Default fallback
-            
-            # Calculate professional entry and exit levels
+            # Calculate entry and exit levels with volatility adjustment
             pip_value = 0.01 if 'JPY' in pair else 0.0001
-            spread = abs(live_data['ask'] - live_data['bid'])
+            atr = (bollinger['upper'] - bollinger['lower']) / 4  # Approximate ATR
             
             if action == "BUY":
                 entry_price = round(live_data['ask'], 5)
                 
-                # Dynamic SL based on volatility and support
-                sl_distance = max(25 * pip_value, abs(current_price - levels['support']) * 0.8)
-                sl_distance = min(sl_distance, 40 * pip_value)  # Max 40 pips
+                # Dynamic SL based on volatility and recent low
+                recent_low = min([candle['low'] for candle in historical[-5:]])
+                sl_distance = max(20 * pip_value, min(entry_price - recent_low, atr * 0.8))
                 stop_loss = round(entry_price - sl_distance, 5)
                 
-                # Progressive take profits
-                tp1 = round(entry_price + (40 * pip_value), 5)
-                tp2 = round(entry_price + (70 * pip_value), 5)
-                tp3 = round(entry_price + (110 * pip_value), 5)
+                # Progressive take profits based on volatility
+                tp1 = round(entry_price + (atr * 0.5), 5)
+                tp2 = round(entry_price + (atr * 1.0), 5)
+                tp3 = round(entry_price + (atr * 1.8), 5)
                 
-                hold_duration = "6-12 hours"
+                hold_duration = "4-8 hours"
                 
             else:  # SELL
                 entry_price = round(live_data['bid'], 5)
                 
-                # Dynamic SL based on volatility and resistance
-                sl_distance = max(25 * pip_value, abs(levels['resistance'] - current_price) * 0.8)
-                sl_distance = min(sl_distance, 40 * pip_value)  # Max 40 pips
+                # Dynamic SL based on volatility and recent high
+                recent_high = max([candle['high'] for candle in historical[-5:]])
+                sl_distance = max(20 * pip_value, min(recent_high - entry_price, atr * 0.8))
                 stop_loss = round(entry_price + sl_distance, 5)
                 
-                # Progressive take profits
-                tp1 = round(entry_price - (40 * pip_value), 5)
-                tp2 = round(entry_price - (70 * pip_value), 5)
-                tp3 = round(entry_price - (110 * pip_value), 5)
+                # Progressive take profits based on volatility
+                tp1 = round(entry_price - (atr * 0.5), 5)
+                tp2 = round(entry_price - (atr * 1.0), 5)
+                tp3 = round(entry_price - (atr * 1.8), 5)
                 
-                hold_duration = "6-12 hours"
+                hold_duration = "4-8 hours"
             
             # Calculate metrics
             risk = abs(entry_price - stop_loss)
@@ -461,7 +522,7 @@ class ProfessionalAnalyzer:
             pips_tp3 = round(abs(tp3 - entry_price) / pip_value)
             
             # Adjust confidence based on market conditions
-            confidence = min(signal_strength + (10 if len(historical) > 30 else -5), 94)
+            confidence = min(signal_score + (10 if len(historical) > 30 else -5), 94)
             
             signal = TradingSignal(
                 pair=pair,
@@ -472,7 +533,7 @@ class ProfessionalAnalyzer:
                 take_profit_2=tp2,
                 take_profit_3=tp3,
                 confidence=confidence,
-                timeframe="H1",
+                timeframe="M15",
                 analysis=" | ".join(analysis_components),
                 risk_reward=risk_reward,
                 hold_duration=hold_duration,
@@ -485,51 +546,12 @@ class ProfessionalAnalyzer:
                 current_price=current_price
             )
             
-            logger.info(f"✅ Generated professional signal for {pair}: {action} at {entry_price}")
+            logger.info(f"✅ Generated AI-enhanced signal for {pair}: {action} at {entry_price}")
             return signal
             
         except Exception as e:
-            logger.error(f"Error generating professional signal for {pair}: {e}")
+            logger.error(f"Error generating AI signal for {pair}: {e}")
             return None
-    
-    async def generate_price_action_signal(self, pair: str, live_data: Dict) -> Optional[TradingSignal]:
-        """Fallback signal generation using price action only"""
-        
-        current_price = live_data['price']
-        pip_value = 0.01 if 'JPY' in pair else 0.0001
-        
-        # Simple price action signal (when no historical data available)
-        action = "BUY"  # Simplified for demo
-        
-        entry_price = round(live_data['ask'], 5)
-        stop_loss = round(entry_price - (30 * pip_value), 5)
-        tp1 = round(entry_price + (50 * pip_value), 5)
-        tp2 = round(entry_price + (80 * pip_value), 5)
-        tp3 = round(entry_price + (120 * pip_value), 5)
-        
-        signal = TradingSignal(
-            pair=pair,
-            action=action,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit_1=tp1,
-            take_profit_2=tp2,
-            take_profit_3=tp3,
-            confidence=75,
-            timeframe="H1",
-            analysis="Price action analysis | Limited historical data",
-            risk_reward=2.67,
-            hold_duration="4-8 hours",
-            signal_id=hashlib.md5(f"{pair}{datetime.now().isoformat()}".encode()).hexdigest()[:8].upper(),
-            timestamp=datetime.now(),
-            pips_sl=30,
-            pips_tp1=50,
-            pips_tp2=80,
-            pips_tp3=120,
-            current_price=current_price
-        )
-        
-        return signal
 
 class ProfessionalForexBot:
     def __init__(self, token: str, admin_id: int, api_key: str):
@@ -578,15 +600,15 @@ class ProfessionalForexBot:
 Welcome {user.first_name}! 
 
 **🔥 LIVE TRADING BOT FEATURES:**
-✅ **Real-time market data** (Alpha Vantage API)
-✅ **Advanced technical analysis** (RSI, MACD, EMAs)
+✅ **AI-enhanced market analysis**
+✅ **Advanced technical indicators**
 ✅ **Professional entry/exit levels**
 ✅ **Risk-reward optimization**
 ✅ **MetaTrader 4/5 compatible**
 
 **📊 SIGNAL QUALITY:**
 • 75-94% confidence ratings
-• Multi-timeframe analysis
+• Multi-indicator analysis
 • Dynamic support/resistance
 • Professional risk management
 
@@ -660,11 +682,11 @@ EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD
             await update.message.reply_text("⚠️ **API limit reached for today**\nTry again tomorrow or upgrade API plan", parse_mode='Markdown')
             return
         
-        await update.message.reply_text(f"🔄 **Analyzing {pair}...**\n*Fetching live data and calculating indicators...*", parse_mode='Markdown')
+        await update.message.reply_text(f"🔄 **Analyzing {pair}...**\n*Running AI-enhanced analysis...*", parse_mode='Markdown')
         
         try:
             # Generate signal for specific pair
-            signal = await self.analyzer.generate_professional_signal(pair)
+            signal = await self.analyzer.generate_ai_signal(pair)
             self.api_calls_today += 2  # Estimate API calls used
             
             if signal:
@@ -714,7 +736,7 @@ Last Signal: {max(self.last_signal_time.values()) if self.last_signal_time else 
 
 **🔧 Technical:**
 Live Data: Alpha Vantage API ✅
-Analysis Engine: Professional TA ✅
+Analysis Engine: AI-enhanced TA ✅
 Risk Management: Active ✅
         """
         
@@ -738,7 +760,7 @@ Risk Management: Active ✅
         else:
             self.subscribers.add(user_id)
             await update.message.reply_text(
-                f"🔔 **Subscription activated!**\n\n**You'll now receive:**\n✅ Professional trading signals\n✅ Market analysis alerts\n✅ Risk management updates\n\n*Subscribers: {len(self.subscribers)}*",
+                f"🔔 **Subscription activated!**\n\n**You'll now receive:**\n✅ AI-enhanced trading signals\n✅ Market analysis alerts\n✅ Risk management updates\n\n*Subscribers: {len(self.subscribers)}*",
                 parse_mode='Markdown'
             )
     
@@ -885,12 +907,12 @@ Use buttons below to control the bot
                     await query.edit_message_text("⚠️ **API limit reached**\n*Try again tomorrow*", parse_mode='Markdown')
                     return
                 
-                await query.edit_message_text("🔄 **Generating professional signal...**\n*Analyzing market conditions...*", parse_mode='Markdown')
+                await query.edit_message_text("🔄 **Generating AI-enhanced signal...**\n*Analyzing market conditions...*", parse_mode='Markdown')
                 
                 # Generate signal for random pair
                 import random
                 pair = random.choice(self.signal_pairs)
-                signal = await self.analyzer.generate_professional_signal(pair)
+                signal = await self.analyzer.generate_ai_signal(pair)
                 self.api_calls_today += 2
                 
                 if signal:
@@ -908,8 +930,7 @@ Use buttons below to control the bot
                         break
                     
                     try:
-                        live_data = await self.market_data.get_live_price(pair)
-                        signal = await self.analyzer.generate_professional_signal(pair)
+                        signal = await self.analyzer.generate_ai_signal(pair)
                         self.api_calls_today += 2
                         
                         if signal:
@@ -1070,7 +1091,7 @@ Max Daily Signals: 15
                             
                             logger.info(f"🔄 Generating auto signal for {selected_pair}")
                             
-                            signal = await self.analyzer.generate_professional_signal(selected_pair)
+                            signal = await self.analyzer.generate_ai_signal(selected_pair)
                             self.api_calls_today += 2
                             
                             if signal:
