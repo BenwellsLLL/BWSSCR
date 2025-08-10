@@ -1246,4 +1246,4 @@ if __name__ == "__main__":
         logger.info("Bot stopped gracefully")
     except Exception as e:
         logger.error(f"Critical error: {e}")
-        print(f"❌ Bot crashed: {e}")
+        print(f"Unfortunately Bot crashed: {e}")
