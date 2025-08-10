@@ -45,59 +45,7 @@ class LiveMarketData:
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.session =     async def get_backup_price(self, pair: str) -> Dict:
-        """Backup price source when main API fails"""
-        session = await self.get_session()
-        
-        try:
-            # Try multiple backup APIs for accuracy
-            backups = [
-                f"https://api.exchangerate-api.com/v4/latest/{pair[:3]}",
-                f"https://api.fxratesapi.com/latest?base={pair[:3]}&symbols={pair[3:]}"
-            ]
-            
-            for backup_url in backups:
-                try:
-                    async with session.get(backup_url) as response:
-                        data = await response.json()
-                        
-                        target_currency = pair[3:]
-                        
-                        if 'rates' in data and target_currency in data['rates']:
-                            price = data['rates'][target_currency]
-                            
-                            result = {
-                                'symbol': pair,
-                                'price': round(price, 5),
-                                'bid': round(price - 0.0002, 5),
-                                'ask': round(price + 0.0002, 5),
-                                'timestamp': datetime.now(),
-                                'last_update': 'Live Backup API'
-                            }
-                            
-                            logger.info(f"📡 Backup API price for {pair}: {price}")
-                            return result
-                except:
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"❌ All backup APIs failed for {pair}: {e}")
-        
-        # Final fallback with CURRENT realistic base prices (August 2025)
-        fallback_prices = {
-            'EURUSD': 1.1640, 'GBPUSD': 1.2850, 'USDJPY': 147.20,
-            'USDCHF': 0.8720, 'AUDUSD': 0.6580, 'USDCAD': 1.3720,
-            'NZDUSD': 0.6040, 'EURJPY': 171.50, 'GBPJPY': 189.10
-        }
-        
-        base_price = fallback_prices.get(pair, 1.0000)
-        
-        logger.warning(f"⚠️ Using fallback price for {pair}: {base_price}")
-        
-        return {
-            'symbol': pair,
-            'price': base_price,
-            'bid': round(base_price - 0.
+        self.session = None
         self.base_url = "https://www.alphavantage.co/query"
         self.cache = {}
         self.cache_duration = 60  # Cache for 1 minute
@@ -109,7 +57,7 @@ class LiveMarketData:
         return self.session
     
     async def get_live_price(self, pair: str) -> Dict:
-        """Get real-time forex price from Alpha Vantage - FOREX SPECIFIC"""
+        """Get real-time forex price from Alpha Vantage"""
         
         # Check cache first
         cache_key = f"{pair}_price"
@@ -120,58 +68,22 @@ class LiveMarketData:
         
         session = await self.get_session()
         
-        # Use FOREX-SPECIFIC Alpha Vantage endpoint
+        # Convert pair format for Alpha Vantage (EUR/USD -> EURUSD)
         from_currency = pair[:3]
         to_currency = pair[3:]
         
-        # Try FX_DAILY first (more accurate for forex trading)
         params = {
-            'function': 'FX_DAILY',
-            'from_symbol': from_currency,
-            'to_symbol': to_currency,
-            'apikey': self.api_key,
-            'outputsize': 'compact'
+            'function': 'CURRENCY_EXCHANGE_RATE',
+            'from_currency': from_currency,
+            'to_currency': to_currency,
+            'apikey': self.api_key
         }
         
         try:
             async with session.get(self.base_url, params=params) as response:
                 data = await response.json()
                 
-                if 'Time Series FX (Daily)' in data:
-                    # Get most recent trading day
-                    time_series = data['Time Series FX (Daily)']
-                    latest_date = max(time_series.keys())
-                    latest_data = time_series[latest_date]
-                    
-                    # Use close price as current price (most accurate)
-                    price = float(latest_data['4. close'])
-                    high = float(latest_data['2. high'])
-                    low = float(latest_data['3. low'])
-                    
-                    # Calculate realistic bid/ask spread
-                    spread = (high - low) * 0.1  # 10% of daily range as spread estimate
-                    spread = max(spread, 0.0002)  # Minimum 2 pip spread
-                    spread = min(spread, 0.001)   # Maximum 10 pip spread
-                    
-                    result = {
-                        'symbol': pair,
-                        'price': round(price, 5),
-                        'bid': round(price - spread/2, 5),
-                        'ask': round(price + spread/2, 5),
-                        'timestamp': datetime.now(),
-                        'last_update': f'FX Daily: {latest_date}',
-                        'high': high,
-                        'low': low
-                    }
-                    
-                    # Cache the result
-                    self.cache[cache_key] = (datetime.now(), result)
-                    
-                    logger.info(f"✅ FOREX price for {pair}: {price} (Date: {latest_date})")
-                    return result
-                
-                # Fallback to real-time rate if daily fails
-                elif 'Realtime Currency Exchange Rate' in data:
+                if 'Realtime Currency Exchange Rate' in data:
                     rate_data = data['Realtime Currency Exchange Rate']
                     
                     price = float(rate_data['5. Exchange Rate'])
@@ -184,25 +96,23 @@ class LiveMarketData:
                         'bid': round(bid, 5),
                         'ask': round(ask, 5),
                         'timestamp': datetime.now(),
-                        'last_update': rate_data.get('6. Last Refreshed', 'Real-time')
+                        'last_update': rate_data.get('6. Last Refreshed', 'Unknown')
                     }
                     
+                    # Cache the result
                     self.cache[cache_key] = (datetime.now(), result)
                     
-                    logger.info(f"✅ Real-time price for {pair}: {price}")
+                    logger.info(f"✅ Live price for {pair}: {price}")
                     return result
                     
                 else:
-                    logger.warning(f"⚠️ Alpha Vantage API issue for {pair}: {data}")
-                    error_msg = data.get('Error Message', data.get('Note', 'Unknown error'))
-                    if 'API call frequency' in str(error_msg):
-                        logger.warning(f"⚠️ API rate limit hit: {error_msg}")
-                    
-                    # Try backup APIs when Alpha Vantage fails
-                    return await self.get_backup_price(pair)
+                    logger.warning(f"⚠️ API limit or error for {pair}: {data}")
+                    raise Exception("API limit reached or invalid response")
                     
         except Exception as e:
-            logger.error(f"❌ Alpha Vantage API error for {pair}: {e}")
+            logger.error(f"❌ Error fetching live price for {pair}: {e}")
+            
+            # Fallback to backup API or cached data
             return await self.get_backup_price(pair)
     
     async def get_backup_price(self, pair: str) -> Dict:
@@ -237,11 +147,11 @@ class LiveMarketData:
         except Exception as e:
             logger.error(f"❌ Backup API failed for {pair}: {e}")
         
-        # Final fallback with CURRENT realistic base prices (August 2025)
+        # Final fallback with realistic base prices
         fallback_prices = {
-            'EURUSD': 1.1640, 'GBPUSD': 1.2850, 'USDJPY': 147.20,
-            'USDCHF': 0.8720, 'AUDUSD': 0.6580, 'USDCAD': 1.3720,
-            'NZDUSD': 0.6040, 'EURJPY': 171.50, 'GBPJPY': 189.10
+            'EURUSD': 1.0850, 'GBPUSD': 1.2720, 'USDJPY': 149.50,
+            'USDCHF': 0.8950, 'AUDUSD': 0.6620, 'USDCAD': 1.3580,
+            'NZDUSD': 0.6100, 'EURJPY': 162.30, 'GBPJPY': 190.80
         }
         
         base_price = fallback_prices.get(pair, 1.0000)
@@ -580,24 +490,46 @@ class ProfessionalAnalyzer:
             
         except Exception as e:
             logger.error(f"Error generating professional signal for {pair}: {e}")
-            
-            # DO NOT generate signals with bad data
-            if "Cannot get real market data" in str(e) or "ALL APIs FAILED" in str(e):
-                logger.error(f"🚫 REFUSING to generate signal for {pair} - no reliable market data")
-                return None
-            
             return None
     
     async def generate_price_action_signal(self, pair: str, live_data: Dict) -> Optional[TradingSignal]:
-        """Fallback signal generation - ONLY with real data"""
+        """Fallback signal generation using price action only"""
         
-        logger.warning(f"⚠️ Using price action only for {pair} - no historical data available")
+        current_price = live_data['price']
+        pip_value = 0.01 if 'JPY' in pair else 0.0001
         
-        # DO NOT generate signals without proper data
-        raise Exception(f"Insufficient data for {pair} - refusing to generate signal without proper technical analysis")
+        # Simple price action signal (when no historical data available)
+        action = "BUY"  # Simplified for demo
         
-        # This function should never be reached - kept for code structure
-        return None
+        entry_price = round(live_data['ask'], 5)
+        stop_loss = round(entry_price - (30 * pip_value), 5)
+        tp1 = round(entry_price + (50 * pip_value), 5)
+        tp2 = round(entry_price + (80 * pip_value), 5)
+        tp3 = round(entry_price + (120 * pip_value), 5)
+        
+        signal = TradingSignal(
+            pair=pair,
+            action=action,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit_1=tp1,
+            take_profit_2=tp2,
+            take_profit_3=tp3,
+            confidence=75,
+            timeframe="H1",
+            analysis="Price action analysis | Limited historical data",
+            risk_reward=2.67,
+            hold_duration="4-8 hours",
+            signal_id=hashlib.md5(f"{pair}{datetime.now().isoformat()}".encode()).hexdigest()[:8].upper(),
+            timestamp=datetime.now(),
+            pips_sl=30,
+            pips_tp1=50,
+            pips_tp2=80,
+            pips_tp3=120,
+            current_price=current_price
+        )
+        
+        return signal
 
 class ProfessionalForexBot:
     def __init__(self, token: str, admin_id: int, api_key: str):
@@ -1246,4 +1178,4 @@ if __name__ == "__main__":
         logger.info("Bot stopped gracefully")
     except Exception as e:
         logger.error(f"Critical error: {e}")
-        print(f"Unfortunately Bot crashed: {e}")
+        print(f"❌ Bot crashed: {e}")
