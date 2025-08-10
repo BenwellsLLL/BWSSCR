@@ -301,7 +301,7 @@ class ProfessionalAnalyzer:
         momentum_value = 0
         if len(prices) > period + 3:
             rsi_values = [100 - (100 / (1 + (sum(gains[i-period:i])/period)/(sum(losses[i-period:i])/period)) 
-                          for i in range(period, len(gains))]
+                          for i in range(period, len(gains)))]
             if len(rsi_values) >= 3:
                 momentum_value = (rsi_values[-1] - rsi_values[-3]) / 2
         
@@ -309,7 +309,7 @@ class ProfessionalAnalyzer:
         divergence = 'none'
         if len(prices) > period * 2:
             price_trend = (prices[-1] - prices[-period]) / prices[-period]
-            rsi_trend = (rsi - (100 - (100 / (1 + (sum(gains[-2*period:-period])/period)/(sum(losses[-2*period:-period])/period))))
+            rsi_trend = (rsi - (100 - (100 / (1 + (sum(gains[-2*period:-period])/period)/(sum(losses[-2*period:-period])/period)))))
             
             if price_trend > 0 and rsi_trend < -5:
                 divergence = 'bearish'
