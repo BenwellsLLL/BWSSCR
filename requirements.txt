@@ -2,3 +2,4 @@ python-telegram-bot
 aiohttp
 pandas
 numpy
+matplotlib
