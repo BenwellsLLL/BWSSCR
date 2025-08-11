@@ -105,48 +105,8 @@ class LiveMarketData:
                     
         except Exception as e:
             logger.error(f"❌ Error fetching live price for {pair}: {e}")
-            return await self.get_backup_price(pair)
-    
-    async def get_backup_price(self, pair: str) -> Dict:
-        session = await self.get_session()
-        try:
-            base_currency = pair[:3]
-            target_currency = pair[3:]
-            url = f"https://api.exchangerate-api.com/v4/latest/{base_currency}"
-            
-            async with session.get(url) as response:
-                data = await response.json()
-                
-                if target_currency in data['rates']:
-                    price = data['rates'][target_currency]
-                    result = {
-                        'symbol': pair,
-                        'price': round(price, 5),
-                        'bid': round(price - 0.0002, 5),
-                        'ask': round(price + 0.0002, 5),
-                        'timestamp': datetime.now(),
-                        'last_update': 'Backup API'
-                    }
-                    logger.info(f"📡 Backup price for {pair}: {price}")
-                    return result
-        except Exception as e:
-            logger.error(f"❌ Backup API failed for {pair}: {e}")
-        
-        fallback_prices = {
-            'EURUSD': 1.0850, 'GBPUSD': 1.2720, 'USDJPY': 149.50,
-            'USDCHF': 0.8950, 'AUDUSD': 0.6620, 'USDCAD': 1.3580,
-            'NZDUSD': 0.6100, 'EURJPY': 162.30, 'GBPJPY': 190.80
-        }
-        
-        base_price = fallback_prices.get(pair, 1.0000)
-        return {
-            'symbol': pair,
-            'price': base_price,
-            'bid': round(base_price - 0.0002, 5),
-            'ask': round(base_price + 0.0002, 5),
-            'timestamp': datetime.now(),
-            'last_update': 'Fallback'
-        }
+            raise
+
 
     async def get_historical_data(self, pair: str, period: str = "1min") -> List[Dict]:
         from_currency = pair[:3]
@@ -1127,7 +1087,7 @@ Max Daily Signals: 15
 if __name__ == "__main__":
     BOT_TOKEN = os.environ.get('BOT_TOKEN', "8147056523:AAEtQHnHUF-da4Jna8GDmp-8Bo0QPA7Gx9k")
     ADMIN_ID = int(os.environ.get('ADMIN_ID', 2137334686))
-    ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', "4QW2QNOA39EH9TOG")
+    ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', "Q61P0HKVKBWT44T4")
     
     bot = ProfessionalForexBot(BOT_TOKEN, ADMIN_ID, ALPHA_VANTAGE_API_KEY)
     
