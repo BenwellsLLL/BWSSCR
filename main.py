@@ -107,7 +107,7 @@ class LiveMarketData:
             logger.error(f"❌ Error fetching live price for {pair}: {e}")
             raise
 
-
+#Name change
     async def get_historical_data(self, pair: str, period: str = "1min") -> List[Dict]:
         from_currency = pair[:3]
         to_currency = pair[3:]
